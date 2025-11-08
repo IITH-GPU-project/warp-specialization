@@ -1,0 +1,17 @@
+(base) :MVT$ sudo env "PATH=$PATH" ncu --export mvt_naive_fp64_N32768_profile --set full --target-processes all ./mvt_naive 
+==PROF== Connected to process 6917 (/home/cms-iith/chma/gpu/warp-specialization/baselines/polybenchGpu_64/CUDA/MVT/mvt_naive)
+setting device 0 with name NVIDIA GeForce RTX 4070 Ti
+==PROF== Profiling "mvt_kernel1" - 0: 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 34 passes
+==PROF== Profiling "mvt_kernel2" - 1: 0%....50%....100% - 34 passes
+GPU Time in seconds:
+47.318396
+CPU Time in seconds:
+35.931653
+Non-Matching CPU-GPU Outputs Beyond Error Threshold of 0.05 Percent: 0
+==PROF== Disconnected from process 6917
+==PROF== Report: /home/cms-iith/chma/gpu/warp-specialization/baselines/polybenchGpu_64/CUDA/MVT/mvt_naive_fp64_N32768_profile.ncu-rep
+

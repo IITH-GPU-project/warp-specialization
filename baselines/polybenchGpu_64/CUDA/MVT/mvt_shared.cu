@@ -21,7 +21,7 @@
 #define TILE 256 // or 512 or 1024 depending on GPU  FOR  Row-wise
 #define TILE2 16 // or 32 (for 2D block) FOR Column-wise
 
-#define N 256
+#define N 4096
 
 #include "mvt.cuh"
 #include "../../common/polybench.h"

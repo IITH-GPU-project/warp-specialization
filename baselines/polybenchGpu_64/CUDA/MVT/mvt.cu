@@ -18,7 +18,7 @@
 
 #define POLYBENCH_TIME 1
 
-#define N 256
+#define N 32768
 
 #include "mvt.cuh"
 #include "../../common/polybench.h"
