@@ -1,4 +1,9 @@
 /**
+// THIS IS NOT AN OPTIMUM SHARED MEMORY VERSION, JUST TO CHECK THE PERFORMAANCE CHANGES ON USING 
+// BOTH SHARED MEMORY FOR MATRIX AND VECTOR
+// 
+// 
+// 
  * mvt.cu: This file is part of the PolyBench/GPU 1.0 test suite.
  *
  *
@@ -18,12 +23,10 @@
 
 #define POLYBENCH_TIME 1
 
-#define TILE 16 // or 512 or 1024 depending on GPU  FOR  Row-wise
+// #define TILE 256 // or 512 or 1024 depending on GPU  FOR  Row-wise
 #define TILE2 16 // or 32 (for 2D block) FOR Column-wise
 
-
 #define N 1024
-
 
 #include "mvt.cuh"
 #include "../../common/polybench.h"
@@ -109,73 +112,99 @@ void GPU_argv_init()
 	cudaSetDevice( GPU_DEVICE );
 }
 
-// row-wise
+// row-wise - loading both A and y
 __global__ void mvt_kernel1(DATA_TYPE *a, DATA_TYPE *x1, DATA_TYPE *y_1)
 {
-	// shared memory tile
-	__shared__ DATA_TYPE ytile[TILE];
+	// shared memory tiles
+	__shared__ DATA_TYPE ytile[TILE2];
+	__shared__ DATA_TYPE Atile[TILE2][TILE2];
 	DATA_TYPE sum = 0.0;
 
 	int row = blockIdx.x * blockDim.x + threadIdx.x;
 
-	for (int t = 0; t < (N - 1) / TILE + 1; ++t){
-		 int col = t * TILE + threadIdx.x;
+	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){
+		int col = t * TILE2 + threadIdx.x;
 
-		 //loading y into shared memory
-		 if (col < N)
-			  ytile[threadIdx.x] = y_1[col];
-		 else
-			  ytile[threadIdx.x] = (DATA_TYPE)0.0;
-		 __syncthreads();
+		// Loading y into shared memory
+		if (col < N)
+			ytile[threadIdx.x] = y_1[col];
+		else
+			ytile[threadIdx.x] = (DATA_TYPE)0.0;
 
-		 // compute partial dot product for this tile
-		 if (row < N){
-			  for (int k = 0; k < TILE; ++k){
-					int c = t * TILE + k;
-					if (c < N)
-						 sum += a[row * N + c] * ytile[k];
-			  }
-		 }
-		 __syncthreads();
+		// Loading tile of A into shared memory
+		// Each thread loads TILE2 elements from its row
+		if (row < N) {
+			for (int k = 0; k < TILE2; ++k) {
+				int global_col = t * TILE2 + k;
+				if (global_col < N)
+					Atile[threadIdx.x][k] = a[row * N + global_col];
+				else
+					Atile[threadIdx.x][k] = (DATA_TYPE)0.0;
+			}
+		} else {
+			for (int k = 0; k < TILE2; ++k) {
+				Atile[threadIdx.x][k] = (DATA_TYPE)0.0;
+			}
+		}
+		
+		__syncthreads();
+
+		// Compute partial dot product for this tile
+		if (row < N){
+			for (int k = 0; k < TILE2; ++k){
+				sum += Atile[threadIdx.x][k] * ytile[k];
+			}
+		}
+		__syncthreads();
 	}
 
-		 if (row < N) 
-			x1[row] += sum;
-	}
+	if (row < N) 
+		x1[row] += sum;
+}
 
 
-// column-wise
+// column-wise - loading both A and y
 __global__ void mvt_kernel2(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2)
 {
-	// shared memory tile
+	// shared memory tiles
 	__shared__ DATA_TYPE Atile[TILE2][TILE2+1];
+	__shared__ DATA_TYPE ytile[TILE2];
 	DATA_TYPE sum = 0.0;
 
 	int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){ //Loading tile A
-		 int tile_row = t * TILE2 + threadIdx.y;
-		 int tile_col = blockIdx.x * TILE2 + threadIdx.x;
+	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){
+		// Loading tile of A
+		int tile_row = t * TILE2 + threadIdx.y;
+		int tile_col = blockIdx.x * TILE2 + threadIdx.x;
 
-		 if (tile_row < N && tile_col < N)
-			  Atile[threadIdx.y][threadIdx.x] = a[tile_row * N + tile_col];
-		 else
-			  Atile[threadIdx.y][threadIdx.x] = (DATA_TYPE)0.0;
-		 __syncthreads();
+		if (tile_row < N && tile_col < N)
+			Atile[threadIdx.y][threadIdx.x] = a[tile_row * N + tile_col];
+		else
+			Atile[threadIdx.y][threadIdx.x] = (DATA_TYPE)0.0;
 
-		//  Now partial dot product
-		if (col < N){
-		 for (int k = 0; k < TILE2; ++k){
-				int r = t * TILE2 + k;
-				if (r < N)
-					 sum += Atile[k][threadIdx.x] * y_2[r];
-		 	}
-		}
+		// Loading y into shared memory
+		int y_idx = t * TILE2 + threadIdx.y;
+		if (threadIdx.x == 0 && y_idx < N)
+			ytile[threadIdx.y] = y_2[y_idx];
+		else if (threadIdx.x == 0)
+			ytile[threadIdx.y] = (DATA_TYPE)0.0;
+
 		__syncthreads();
 
+		// Now partial dot product
+		if (col < N){
+			for (int k = 0; k < TILE2; ++k){
+				int r = t * TILE2 + k;
+				if (r < N)
+					sum += Atile[k][threadIdx.x] * ytile[k];
+			}
+		}
+		__syncthreads();
 	}
-		 if (col < N)
-		 	x2[col] += sum;
+
+	if (col < N)
+		x2[col] += sum;
 }
 
 void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1D(x1, N, n), DATA_TYPE POLYBENCH_1D(x2, N, n), DATA_TYPE POLYBENCH_1D(y_1, N, n), DATA_TYPE POLYBENCH_1D(y_2, N, n), 
@@ -199,8 +228,8 @@ void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1
 	cudaMemcpy(y_2_gpu, y_2, sizeof(DATA_TYPE) * N, cudaMemcpyHostToDevice);
 	
 	// TILE as block size
-	dim3 block(TILE);
-	dim3 grid((size_t)ceil((float)N/ ((float)TILE)));
+	// dim3 block(TILE);
+	// dim3 grid((size_t)ceil((float)N/ ((float)TILE)));
 
 	dim3 block2(TILE2, TILE2);
 	dim3 grid2((size_t)ceil((float)N/ ((float)TILE2)));
@@ -208,7 +237,7 @@ void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1
 	/* Start timer. */
   	polybench_start_instruments;
 	
-	mvt_kernel1<<<grid,block>>>(a_gpu,x1_gpu,y_1_gpu);
+	mvt_kernel1<<<grid2,block2>>>(a_gpu,x1_gpu,y_1_gpu);
 	mvt_kernel2<<<grid2,block2>>>(a_gpu,x2_gpu,y_2_gpu);
 	cudaThreadSynchronize();
 
