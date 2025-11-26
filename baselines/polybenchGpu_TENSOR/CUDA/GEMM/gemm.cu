@@ -1,9 +1,3 @@
-/**
- * gemm.cu: This file is part of the PolyBench/GPU 1.0 test suite.
- *
- * Modified for Tensor Core (WMMA) implementation using __half for A and B.
- */
-
 #include <unistd.h>
 #include <stdio.h>
 #include <time.h>
@@ -14,16 +8,19 @@
 #include <cuda_fp16.h> // Include for __half type
 #include <cuda.h>
 #include <mma.h> // Include for WMMA APIs
+#include <omp.h> //added for OpenMP
+#include "gemm.cuh"
 
-// Use the nvcuda namespace for WMMA functions
+//
+#include "../../common/polybench.h"
+#include "../../common/polybenchUtilFuncts.h"
+#include "../../common/polybench.c"
+
+//
 using namespace nvcuda;
 using namespace wmma;
 
 #define POLYBENCH_TIME 1
-
-#include "gemm.cuh"
-#include "../../common/polybench.h"
-#include "../../common/polybenchUtilFuncts.h"
 
 #define GPU_DEVICE 0
 
@@ -32,19 +29,17 @@ using namespace wmma;
 
 /* Declared constant values for ALPHA and BETA (same as values in PolyBench 2.0) */
 #define ALPHA 1.5f
-#define BETA 0.5f
+#define BETA 2.0f
 
 #define RUN_ON_CPU
 
-// --- WMMA Tiling Configuration ---
-// Note: We will use a standard 16x16 thread block size (256 threads)
-// to compute a 128x128 tile of the C matrix.
+// Thread block dimensions
 #define BLOCK_DIM_X 32
 #define BLOCK_DIM_Y 1
 
-// M, N, K tile size for the thread block
-#define TILE_M 128
-#define TILE_N 128
+// WMMA tile size (fixed computation size by tensor cores)
+#define TILE_M 16
+#define TILE_N 16
 #define TILE_K 16 // The K dimension is fixed by the WMMA API (16 for 16x16x16)
 
 // The WMMA configuration uses 16x16x16 for __half inputs and float accumulator.
@@ -53,7 +48,7 @@ typedef fragment<matrix_b, 16, 16, 16, __half, row_major> fragment_b_t;
 typedef fragment<accumulator, 16, 16, 16, float> fragment_c_t;
 // ---------------------------------
 
-// Function to convert float array to half array
+//function to convert float array to half array
 void float_to_half_array(const DATA_TYPE *input, __half *output, size_t size)
 {
     for (size_t i = 0; i < size; ++i)
@@ -64,28 +59,28 @@ void float_to_half_array(const DATA_TYPE *input, __half *output, size_t size)
 
 
 /* CPU implementation for verification */
-void gemm(int ni, int nj, int nk, DATA_TYPE alpha, DATA_TYPE beta, DATA_TYPE POLYBENCH_2D(A,NI,NK,ni,nk), 
-     DATA_TYPE POLYBENCH_2D(B,NK,NJ,nk,nj), DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj))
+void gemm(int ni, int nj, int nk, DATA_TYPE alpha, DATA_TYPE beta, DATA_TYPE POLYBENCH_2D(A,NI,NK,ni,nk), DATA_TYPE POLYBENCH_2D(B,NK,NJ,nk,nj), DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj))
 {
     int i,j,k;
     
+    // Parallelize the outer loop with OpenMP
+    #pragma omp parallel for private(j, k)
     for (i = 0; i < _PB_NI; i++)
     {
-            for (j = 0; j < _PB_NJ; j++)
-            {
+        for (j = 0; j < _PB_NJ; j++)
+        {
             C[i][j] *= beta;
     
             for (k = 0; k < _PB_NK; ++k)
             {
                 C[i][j] += alpha * A[i][k] * B[k][j];
             }
-            }
+        }
     }
 }
 
 
-void init(int ni, int nj, int nk, DATA_TYPE* alpha, DATA_TYPE* beta, DATA_TYPE POLYBENCH_2D(A,NI,NK,ni,nk), 
-    DATA_TYPE POLYBENCH_2D(B,NK,NJ,nk,nj), DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj))
+void init(int ni, int nj, int nk, DATA_TYPE* alpha, DATA_TYPE* beta, DATA_TYPE POLYBENCH_2D(A,NI,NK,ni,nk), DATA_TYPE POLYBENCH_2D(B,NK,NJ,nk,nj), DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj))
 {
     int i, j;
 
@@ -128,7 +123,7 @@ void compareResults(int ni, int nj, DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj), DATA_
     {
         for (j=0; j < nj; j++) 
         {
-            // Note: Since we used FP16 for multiplication, we must increase the tolerance.
+            // since we used FP16 for multiplication, we must increase the tolerance.
             if (percentDiff(C[i][j], C_outputFromGpu[i][j]) > PERCENT_DIFF_ERROR_THRESHOLD * 10) 
             {
                 fail++;
@@ -146,22 +141,17 @@ void GPU_argv_init()
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, GPU_DEVICE);
     
-    // Check for Tensor Core support (Compute Capability 7.0 or higher)
+    //
     if (deviceProp.major < 7) {
         printf("Error: GPU (Device %d) does not support Tensor Cores (Requires Compute Capability 7.0+).\n", GPU_DEVICE);
         printf("Proceeding with standard GEMM kernel as fallback might be necessary.\n");
-        // In a real application, you would switch to the standard kernel here.
+        //
     }
     
-    printf("Setting device %d with name %s, Compute Capability %d.%d\n", 
-        GPU_DEVICE, deviceProp.name, deviceProp.major, deviceProp.minor);
+    printf("Setting device %d with name %s, Compute Capability %d.%d\n", GPU_DEVICE, deviceProp.name, deviceProp.major, deviceProp.minor);
     cudaSetDevice( GPU_DEVICE );
 }
 
-
-/* Old standard kernel (retained for comparison, not used in gemmCuda now)
-__global__ void gemm_standard_kernel(...) { ... }
-*/
 
 __global__ void gemm_wmma_kernel(int ni, int nj, int nk, DATA_TYPE alpha, DATA_TYPE beta, const __half *a, const __half *b, DATA_TYPE *c)
 {
@@ -222,7 +212,7 @@ __global__ void gemm_wmma_kernel(int ni, int nj, int nk, DATA_TYPE alpha, DATA_T
             }
         }
 
-        // Perform the WMMA operation: D = D + A * B
+        //
         for (int i = 0; i < M_TILES; i++)
         {
             for (int j = 0; j < N_TILES; j++)
@@ -266,54 +256,61 @@ __global__ void gemm_wmma_kernel(int ni, int nj, int nk, DATA_TYPE alpha, DATA_T
 void gemmCuda(int ni, int nj, int nk, DATA_TYPE alpha, DATA_TYPE beta, DATA_TYPE POLYBENCH_2D(A,NI,NK,ni,nk), 
     DATA_TYPE POLYBENCH_2D(B,NK,NJ,nk,nj), DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj), DATA_TYPE POLYBENCH_2D(C_outputFromGpu,NI,NJ,ni,nj))
 {
-    // A and B will be stored as __half on the device
+    
+    //
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    //
     __half *A_gpu_half;
     __half *B_gpu_half;
-    // C will remain float (DATA_TYPE) on the device for higher precision accumulation
     DATA_TYPE *C_gpu;
 
-    // 1. Allocate host memory for FP16 conversion
+    //Allocate host memory for FP16 conversion
     __half *A_host_half = (__half*)malloc(sizeof(__half) * NI * NK);
     __half *B_host_half = (__half*)malloc(sizeof(__half) * NK * NJ);
 
-    // 2. Convert FP32 host data to FP16 host data
+    //Convert FP32 host data to FP16 host data
     float_to_half_array(A[0], A_host_half, NI * NK);
     float_to_half_array(B[0], B_host_half, NK * NJ);
 
-    // 3. Allocate device memory (A and B as __half, C as DATA_TYPE/float)
+    //Allocate device memory (A and B as __half, C as DATA_TYPE/float)
     cudaMalloc((void **)&A_gpu_half, sizeof(__half) * NI * NK);
     cudaMalloc((void **)&B_gpu_half, sizeof(__half) * NK * NJ);
     cudaMalloc((void **)&C_gpu, sizeof(DATA_TYPE) * NI * NJ); // C remains float/DATA_TYPE
 
-    // 4. Copy data to device
+    //Copy data to device
     cudaMemcpy(A_gpu_half, A_host_half, sizeof(__half) * NI * NK, cudaMemcpyHostToDevice);
     cudaMemcpy(B_gpu_half, B_host_half, sizeof(__half) * NK * NJ, cudaMemcpyHostToDevice);
-    // C is initially FP32
     cudaMemcpy(C_gpu, C[0], sizeof(DATA_TYPE) * NI * NJ, cudaMemcpyHostToDevice);
     
-    // 5. Define launch configuration for WMMA
-    // Thread block size (16x16 = 256 threads)
-    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y); 
-    
-    // Grid size, based on tiling TILE_M x TILE_N (128x128)
+    //Define launch configuration for WMMA
+    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
     dim3 grid((size_t)(ceil( ((float)NJ) / ((float)TILE_N) )), (size_t)(ceil( ((float)NI) / ((float)TILE_M) )));
 
     /* Start timer. */
-    polybench_start_instruments;
+    // polybench_start_instruments;
+    cudaEventRecord(start);
 
     // Launch the WMMA kernel
     gemm_wmma_kernel<<< grid, block >>>(ni, nj, nk, alpha, beta, A_gpu_half, B_gpu_half, C_gpu);
-    cudaThreadSynchronize();
+
+    cudaEventRecord(stop);
+    cudaDeviceSynchronize();
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
 
     /* Stop and print timer. */
-    printf("GPU Time (WMMA) in seconds:\n");
-    polybench_stop_instruments;
-    polybench_print_instruments;
+    printf("GPU Time in seconds: %f secs\n", milliseconds * 0.001);
+    // polybench_stop_instruments;
+    // polybench_print_instruments;
 
-    // 6. Copy result back from device (C_outputFromGpu is FP32/DATA_TYPE)
+    //Copy result back from device (C_outputFromGpu is FP32/DATA_TYPE)
     cudaMemcpy(C_outputFromGpu[0], C_gpu, sizeof(DATA_TYPE) * NI * NJ, cudaMemcpyDeviceToHost);    
     
-    // 7. Cleanup
+    //Cleanup
     cudaFree(A_gpu_half);
     cudaFree(B_gpu_half);
     cudaFree(C_gpu);
@@ -322,8 +319,7 @@ void gemmCuda(int ni, int nj, int nk, DATA_TYPE alpha, DATA_TYPE beta, DATA_TYPE
 }
 
 
-/* DCE code. Must scan the entire live-out data.
-   Can be used also to check the correctness of the output. */
+
 static
 void print_array(int ni, int nj,
          DATA_TYPE POLYBENCH_2D(C,NI,NJ,ni,nj))
@@ -404,6 +400,4 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
-#include "../../common/polybench.c"
 
