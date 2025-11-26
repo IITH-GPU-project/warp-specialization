@@ -26,7 +26,7 @@
 #define DMA_WARPS1 4//1
 
 // KERNEL 2
-#define TILE2 16 // or 32 (for 2D block) FOR Column-wise
+#define TILE2 64 // or 32 (for 2D block) FOR Column-wise
 #define num_threads_in_block_x 16//16
 #define num_threads_in_block_y 16//32
 #define DMA_WARPS2 7//1
@@ -182,7 +182,8 @@ __global__ void mvt_kernel2_ws(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int 
 
     __shared__ DATA_TYPE y_tile[2][TILE2];
     
-    int col_start = blockIdx.x * TILE2;
+    int loader_id = lane_id + warp_id * 32;
+	int col_start = blockIdx.x * TILE2;
     int cols_in_block = min(TILE2, max(0, N - col_start));
     int compute_col = (is_loader) ? -1 : (lane_id + (warp_id - Loader_Warps) * 32);
     int num_tiles = (N + TILE2 - 1) / TILE2;
@@ -190,8 +191,8 @@ __global__ void mvt_kernel2_ws(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int 
     
     // Prefetch: Load first y_2 tile
     if (is_loader) {
-        for (int row = threadIdx.x; row < TILE2; row += 32 * Loader_Warps) {
-            y_tile[0][row] = (row < N) ? y_2[row] : 0.0;
+        for (int row = loader_id; row < TILE2; row += 32 * Loader_Warps) {
+            y_tile[0][row] = (row < N) ? y_2[row] : (DATA_TYPE) 0.0;
         }
     }
     __syncthreads();
@@ -203,9 +204,9 @@ __global__ void mvt_kernel2_ws(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int 
         
         // Loader warps: Load next y_2 tile
         if (is_loader && t + 1 < num_tiles) {
-            for (int row = threadIdx.x; row < TILE2; row += 32 * Loader_Warps) {
+            for (int row = loader_id; row < TILE2; row += 32 * Loader_Warps) {
                 int global_row = (t + 1) * TILE2 + row;
-                y_tile[next][row] = (global_row < N) ? y_2[global_row] : 0.0;
+                y_tile[next][row] = (global_row < N) ? y_2[global_row] : (DATA_TYPE) 0.0;
             }
         }
         
@@ -223,73 +224,73 @@ __global__ void mvt_kernel2_ws(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int 
 					}
 				}
 				x2[col] += sum;
-        }
-        __syncthreads();
+        	}
     	}
+		__syncthreads();
 	}
 }
 
-
 // column-wise loading A into shared memory
-// __global__ void mvt_kernel2_ws_A(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int Loader_Warps)
-// {
-// 	int local_tid = threadIdx.y * blockDim.x + threadIdx.x;
-// 	int warp_id = local_tid / 32;
-// 	int lane_id = local_tid % 32;
-// 	const int NUM_WARPS = blockDim.x * blockDim.y / 32;
-// 	const bool is_loader = (warp_id < Loader_Warps);
+__global__ void mvt_kernel2_ws_A(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int Loader_Warps)
+{
+	int local_tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warp_id = local_tid / 32;
+	int lane_id = local_tid % 32;
+	const int NUM_WARPS = blockDim.x * blockDim.y / 32;
+	const bool is_loader = (warp_id < Loader_Warps);
 
-// 	// shared memory for ping-pong buffering
-// 	__shared__ DATA_TYPE Atile[2][TILE2][TILE2+1];  
+	// shared memory for ping-pong buffering
+	__shared__ DATA_TYPE Atile[2][TILE2][TILE2+1];  
 
 	
-// 	int col_start = blockIdx.x * TILE2;
-// 	int cols_in_block = min(TILE2, max(0, N - col_start));
-// 	int compute_col = (is_loader) ? -1 : (lane_id + (warp_id - Loader_Warps) * 32);
-// 	int num_tiles = (N - 1) / (TILE2) + 1;
+	int col_start = blockIdx.x * TILE2;
+	int cols_in_block = min(TILE2, max(0, N - col_start));
+	int compute_col = (is_loader) ? -1 : (lane_id + (warp_id - Loader_Warps) * 32);
+	int num_tiles = (N - 1) / (TILE2) + 1;
 	
-// 	// Loading the A tile for the first time (prefetch)
-// 	if (is_loader) {
-// 		for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
-// 			int r = idx / TILE2;
-// 			int c = idx % TILE2;
-// 			Atile[0][r][c] = (r < N && (col_start + c) < N) ? a[r*N + (col_start + c)] : 0.0;
-// 		}
-// 	}
-// 	__syncthreads();
+	// Loading the A tile for the first time (prefetch)
+	if (is_loader) {
+		for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
+			int r = idx / TILE2;
+			int c = idx % TILE2;
+			Atile[0][r][c] = (r < N && (col_start + c) < N) ? a[r*N + (col_start + c)] : 0.0;
+		}
+	}
+	__syncthreads();
 	
-// 	// Starting ping-pong buffering loop
-// 	for (int t = 0; t < num_tiles; ++t) {
-// 		int current = t % 2;
-// 		int next = (t + 1) % 2;
+	// Starting ping-pong buffering loop
+	for (int t = 0; t < num_tiles; ++t) {
+		int current = t % 2;
+		int next = (t + 1) % 2;
 		
-// 		// Loader warps: Load next tile
-// 		if (is_loader && t + 1 < num_tiles) {
-// 			for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
-// 				int r = idx / TILE2;
-// 				int c = idx % TILE2;
-// 				int global_r = (t + 1) * TILE2 + r;
-// 				Atile[next][r][c] = (global_r < N && (col_start + c) < N) ? a[global_r*N + (col_start + c)] : 0.0;
-// 			}
-// 		}
+		// Loader warps: Load next tile
+		if (is_loader && t + 1 < num_tiles) {
+			for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
+				int r = idx / TILE2;
+				int c = idx % TILE2;
+				int global_r = (t + 1) * TILE2 + r;
+				Atile[next][r][c] = (global_r < N && (col_start + c) < N) ? a[global_r*N + (col_start + c)] : 0.0;
+			}
+		}
 
-// 		// Compute warps: Process current tile
-// 		if (!is_loader) {
-// 			for (int c = compute_col; c < cols_in_block; c += 32 * (NUM_WARPS - Loader_Warps)) {
-// 				int col = col_start + c;
-// 				if (col >= N) continue;
-// 				DATA_TYPE sum = 0.0;
-// 				for (int k = 0; k < TILE2; ++k) {
-// 					int r = t * TILE2 + k;
-// 					if (r < N)
-// 						sum += Atile[current][k][c] * y_2[r];
-// 				}
-// 				x2[col] += sum;
-// 			}
-// 		}
-// 		__syncthreads(); 
-// 	}
-// }
+		// Compute warps: Process current tile
+		if (!is_loader) {
+			for (int c = compute_col; c < cols_in_block; c += 32 * (NUM_WARPS - Loader_Warps)) {
+				int col = col_start + c;
+				if (col >= N) continue;
+				DATA_TYPE sum = 0.0;
+				for (int k = 0; k < TILE2; ++k) {
+					int r = t * TILE2 + k;
+					if (r < N)
+						sum += Atile[current][k][c] * y_2[r];
+				}
+				x2[col] += sum;
+			}
+		}
+		__syncthreads(); 
+	}
+}
+
 
 
 
@@ -324,7 +325,8 @@ void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1
   	polybench_start_instruments;
 	
 	mvt_kernel1_ws<<<grid,block>>>(a_gpu,x1_gpu,y_1_gpu, DMA_WARPS1);
-	mvt_kernel2_ws<<<grid2,block2>>>(a_gpu,x2_gpu,y_2_gpu, DMA_WARPS2);
+	mvt_kernel2_ws<<<grid,block>>>(a_gpu,x2_gpu,y_2_gpu, DMA_WARPS1);
+//	mvt_kernel2_ws<<<grid2,block2>>>(a_gpu,x2_gpu,y_2_gpu, DMA_WARPS2);
 	cudaThreadSynchronize();
 
 	/* Stop and print timer. */
