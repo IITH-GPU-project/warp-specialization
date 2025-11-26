@@ -18,12 +18,10 @@
 
 #define POLYBENCH_TIME 1
 
-#define TILE 16 // or 512 or 1024 depending on GPU  FOR  Row-wise
-#define TILE2 16 // or 32 (for 2D block) FOR Column-wise
-
+#define TILE 32 // or 512 or 1024 depending on GPU  FOR  Row-wise
+#define TILE2 32 // or 32 (for 2D block) FOR Column-wise
 
 #define N 1024
-
 
 #include "mvt.cuh"
 #include "../../common/polybench.h"
@@ -143,9 +141,47 @@ __global__ void mvt_kernel1(DATA_TYPE *a, DATA_TYPE *x1, DATA_TYPE *y_1)
 			x1[row] += sum;
 	}
 
-
-// column-wise
+// column-wise | Loads tile of y into shared memory
 __global__ void mvt_kernel2(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2)
+{
+    // shared memory tile
+    __shared__ DATA_TYPE y_tile[TILE2];
+	DATA_TYPE sum = 0.0;
+	
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_tiles = (N + TILE2 - 1) / TILE2;
+    
+    for (int t = 0; t < num_tiles; ++t) {
+        int row_base = t * TILE2;
+        
+        // loading y in shared memory
+        if (threadIdx.x < TILE2) {
+            int row = row_base + threadIdx.x;
+            y_tile[threadIdx.x] = (row < N) ? y_2[row] : 0.0;
+        }
+        __syncthreads();
+        
+        // computing partial dot product for this tile
+        if (col < N) {
+            for (int k = 0; k < TILE2; ++k) {
+                int row = row_base + k;
+                if (row < N) {
+                    sum += a[row * N + col] * y_tile[k];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Writing final sum
+    if (col < N) {
+        x2[col] = sum;
+    }
+}
+
+
+// column-wise | Loads tile of A into shared memory
+__global__ void mvt_kernel2_A(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2)
 {
 	// shared memory tile
 	__shared__ DATA_TYPE Atile[TILE2][TILE2+1];
@@ -153,11 +189,11 @@ __global__ void mvt_kernel2(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2)
 
 	int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){ //Loading tile A
+	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){ 
 		 int tile_row = t * TILE2 + threadIdx.y;
-		 int tile_col = blockIdx.x * TILE2 + threadIdx.x;
-
-		 if (tile_row < N && tile_col < N)
+		 int tile_col = blockIdx.x * TILE2 + threadIdx.x; 
+	//Loading tile A
+		 if (tile_row < N && tile_col < N) 
 			  Atile[threadIdx.y][threadIdx.x] = a[tile_row * N + tile_col];
 		 else
 			  Atile[threadIdx.y][threadIdx.x] = (DATA_TYPE)0.0;
@@ -202,7 +238,9 @@ void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1
 	dim3 block(TILE);
 	dim3 grid((size_t)ceil((float)N/ ((float)TILE)));
 
-	dim3 block2(TILE2, TILE2);
+	// dim3 block2(TILE2, TILE2);
+	// dim3 grid2((size_t)ceil((float)N/ ((float)TILE2)));
+	dim3 block2(TILE2);
 	dim3 grid2((size_t)ceil((float)N/ ((float)TILE2)));
 
 	/* Start timer. */
