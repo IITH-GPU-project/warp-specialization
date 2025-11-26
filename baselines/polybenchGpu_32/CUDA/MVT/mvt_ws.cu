@@ -18,13 +18,18 @@
 
 #define POLYBENCH_TIME 1
 
-#define TILE 64 // or 512 or 1024 depending on GPU  FOR  Row-wise
-#define TILE2 16 // or 32 (for 2D block) FOR Column-wise
-
 #define N 1024
 
-#define num_threads_in_block 3*TILE 
-#define DMA_WARPS 2
+// KERNEL 1
+#define TILE 64 // or 512 or 1024 depending on GPU  FOR  Row-wise
+#define num_threads_in_block 256//2*TILE 
+#define DMA_WARPS1 4//1
+
+// KERNEL 2
+#define TILE2 16 // or 32 (for 2D block) FOR Column-wise
+#define num_threads_in_block_x 16//16
+#define num_threads_in_block_y 16//32
+#define DMA_WARPS2 7//1
 
 #include "mvt.cuh"
 #include "../../common/polybench.h"
@@ -121,8 +126,8 @@ __global__ void mvt_kernel1_ws(DATA_TYPE *a, DATA_TYPE *x1, DATA_TYPE *y_1, int 
     // shared memory for ping-pong buffering
     __shared__ DATA_TYPE ytile[2][TILE];  
 	
-	int row_start = blockIdx.x * blockDim.x;
-	int rows_in_block = min(blockDim.x, max(0, N - row_start));
+	int row_start = blockIdx.x * TILE;
+	int rows_in_block = min(TILE, max(0, N - row_start));
 	int compute_row = (is_loader) ? -1 : (lane_id + (warp_id - Loader_Warps) * 32);
     int num_tiles = (N - 1) / (TILE) + 1;
     
@@ -166,38 +171,66 @@ __global__ void mvt_kernel1_ws(DATA_TYPE *a, DATA_TYPE *x1, DATA_TYPE *y_1, int 
 }
 	
 
-__global__ void mvt_kernel2(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2)
+__global__ void mvt_kernel2_ws(DATA_TYPE *a, DATA_TYPE *x2, DATA_TYPE *y_2, int Loader_Warps)
 {
-	// shared memory tile
-	__shared__ DATA_TYPE Atile[TILE2][TILE2+1];
-	DATA_TYPE sum = 0.0;
+	int local_tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warp_id = local_tid / 32;
+	int lane_id = local_tid % 32;
+	const int NUM_WARPS = blockDim.x * blockDim.y / 32;
+	const bool is_loader = (warp_id < Loader_Warps);
 
-	int col = blockIdx.x * blockDim.x + threadIdx.x;
+	// shared memory for ping-pong buffering
+	__shared__ DATA_TYPE Atile[2][TILE2][TILE2+1];  
 
-	for (int t = 0; t < (N - 1) / TILE2 + 1; ++t){ //Loading tile A
-		 int tile_row = t * TILE2 + threadIdx.y;
-		 int tile_col = blockIdx.x * TILE2 + threadIdx.x;
-
-		 if (tile_row < N && tile_col < N)
-			  Atile[threadIdx.y][threadIdx.x] = a[tile_row * N + tile_col];
-		 else
-			  Atile[threadIdx.y][threadIdx.x] = (DATA_TYPE)0.0;
-		 __syncthreads();
-
-		//  Now partial dot product
-		if (col < N){
-		 for (int k = 0; k < TILE2; ++k){
-				int r = t * TILE2 + k;
-				if (r < N)
-					 sum += Atile[k][threadIdx.x] * y_2[r];
-		 	}
+	
+	int col_start = blockIdx.x * TILE2;
+	int cols_in_block = min(TILE2, max(0, N - col_start));
+	int compute_col = (is_loader) ? -1 : (lane_id + (warp_id - Loader_Warps) * 32);
+	int num_tiles = (N - 1) / (TILE2) + 1;
+	
+	// Loading the A tile for the first time (prefetch)
+	if (is_loader) {
+		for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
+			int r = idx / TILE2;
+			int c = idx % TILE2;
+			Atile[0][r][c] = (r < N && (col_start + c) < N) ? a[r*N + (col_start + c)] : 0.0;
 		}
-		__syncthreads();
-
 	}
-		 if (col < N)
-		 	x2[col] += sum;
+	__syncthreads();
+	
+	// Starting ping-pong buffering loop
+	for (int t = 0; t < num_tiles; ++t) {
+		int current = t % 2;
+		int next = (t + 1) % 2;
+		
+		// Loader warps: Load next tile
+		if (is_loader && t + 1 < num_tiles) {
+			for (int idx = local_tid; idx < TILE2 * TILE2; idx += 32 * Loader_Warps) {
+				int r = idx / TILE2;
+				int c = idx % TILE2;
+				int global_r = (t + 1) * TILE2 + r;
+				Atile[next][r][c] = (global_r < N && (col_start + c) < N) ? a[global_r*N + (col_start + c)] : 0.0;
+			}
+		}
+
+		// Compute warps: Process current tile
+		if (!is_loader) {
+			for (int c = compute_col; c < cols_in_block; c += 32 * (NUM_WARPS - Loader_Warps)) {
+				int col = col_start + c;
+				if (col >= N) continue;
+				DATA_TYPE sum = 0.0;
+				for (int k = 0; k < TILE2; ++k) {
+					int r = t * TILE2 + k;
+					if (r < N)
+						sum += Atile[current][k][c] * y_2[r];
+				}
+				x2[col] += sum;
+			}
+		}
+		__syncthreads(); 
+	}
 }
+
 
 void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1D(x1, N, n), DATA_TYPE POLYBENCH_1D(x2, N, n), DATA_TYPE POLYBENCH_1D(y_1, N, n), DATA_TYPE POLYBENCH_1D(y_2, N, n), 
 			DATA_TYPE POLYBENCH_1D(x1_outputFromGpu, N, n), DATA_TYPE POLYBENCH_1D(x2_outputFromGpu, N, n))
@@ -223,14 +256,14 @@ void mvtCuda(int n, DATA_TYPE POLYBENCH_2D(a, N, N, n, n), DATA_TYPE POLYBENCH_1
 	dim3 block(num_threads_in_block);
 	dim3 grid((size_t)ceil((float)N/ ((float)TILE)));
 
-	dim3 block2(TILE2, TILE2);
+	dim3 block2(num_threads_in_block_x, num_threads_in_block_y);
 	dim3 grid2((size_t)ceil((float)N/ ((float)TILE2)));
 
 	/* Start timer. */
   	polybench_start_instruments;
 	
-	mvt_kernel1_ws<<<grid,block>>>(a_gpu,x1_gpu,y_1_gpu, DMA_WARPS);
-	mvt_kernel2<<<grid2,block2>>>(a_gpu,x2_gpu,y_2_gpu);
+	mvt_kernel1_ws<<<grid,block>>>(a_gpu,x1_gpu,y_1_gpu, DMA_WARPS1);
+	mvt_kernel2_ws<<<grid2,block2>>>(a_gpu,x2_gpu,y_2_gpu, DMA_WARPS2);
 	cudaThreadSynchronize();
 
 	/* Stop and print timer. */
